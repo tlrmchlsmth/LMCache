@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -339,6 +341,13 @@ class LMCacheConnectorV1Impl:
         # TODO: need to align this chunk size with lmcache
         self._lmcache_chunk_size = 256
 
+    def is_request_done_receiving(self, request: "Request") -> bool:
+        num_external_hit_tokens = self.lookup_client.lookup(
+            torch.tensor(request.prompt_token_ids))
+        if num_external_hit_tokens > 0:
+            logger.info(f"{num_external_hit_tokens=}")
+        return num_external_hit_tokens == len(request.prompt_token_ids)
+
     def _init_kv_caches_from_forward_context(
             self, forward_context: "ForwardContext"):
         for layer_name in forward_context.no_compile_layers:
@@ -382,7 +391,7 @@ class LMCacheConnectorV1Impl:
         if attn_metadata is None:
             logger.warning(
                 "In connector.start_load_kv, but the attn_metadata is None")
-            return
+            # return
 
         # HACK: getting chunk size to correctly calculate retrieve mask
         assert self.lmcache_engine is not None
@@ -466,6 +475,10 @@ class LMCacheConnectorV1Impl:
             save_spec = request.save_spec
             if save_spec is None or not save_spec.can_save:
                 continue
+                
+            if os.getenv("DEBUG_DELAY_SAVE", "0") == "1":
+                logger.info("Sleeping to show that the worker is blocked.")
+                time.sleep(1.)
 
             token_ids = request.token_ids
             assert isinstance(token_ids, torch.Tensor)
