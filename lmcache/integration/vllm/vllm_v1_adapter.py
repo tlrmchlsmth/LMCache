@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import time
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -458,11 +459,6 @@ class LMCacheConnectorV1Impl:
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-        
-        if os.getenv["DEBUG_DELAY_SAVE"] == "1":
-            import time
-            logger.info("Sleeping to show that the worker is blocked.")
-            time.sleep(2.)
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
@@ -478,6 +474,10 @@ class LMCacheConnectorV1Impl:
             save_spec = request.save_spec
             if save_spec is None or not save_spec.can_save:
                 continue
+                
+            if os.getenv("DEBUG_DELAY_SAVE", "0") == "1":
+                logger.info("Sleeping to show that the worker is blocked.")
+                time.sleep(1.)
 
             token_ids = request.token_ids
             assert isinstance(token_ids, torch.Tensor)
