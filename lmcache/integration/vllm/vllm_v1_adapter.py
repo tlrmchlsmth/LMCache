@@ -342,10 +342,13 @@ class LMCacheConnectorV1Impl:
         self._lmcache_chunk_size = 256
 
     def is_request_done_receiving(self, request: "Request") -> bool:
+        # NOTE(rob): this is extremely brittle and will cause
+        # issues where this never returns true (causing deadlock)
+        # if e.g. we evict RECVObjPool before lookup.
         num_external_hit_tokens = self.lookup_client.lookup(
             torch.tensor(request.prompt_token_ids))
         if num_external_hit_tokens > 0:
-            logger.info(f"{num_external_hit_tokens=}")
+            logger.debug(f"{num_external_hit_tokens=}")
         return num_external_hit_tokens == len(request.prompt_token_ids)
 
     def _init_kv_caches_from_forward_context(
@@ -615,6 +618,7 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
 
+<<<<<<< HEAD
         for request_id in scheduler_output.new_KV_req_ids_to_send:
             assert self.kv_role == "kv_producer"
             request_tracker = self._request_trackers[request_id]
@@ -631,6 +635,11 @@ class LMCacheConnectorV1Impl:
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
+=======
+        for request in scheduler_output.scheduled_new_reqs:
+            # NOTE(rob): all new reqs are added to tracker for both
+            # producer and consumer side.
+>>>>>>> async_pd
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = request.num_computed_tokens + \
                     scheduler_output.num_scheduled_tokens[request.req_id]
@@ -638,10 +647,17 @@ class LMCacheConnectorV1Impl:
                 request, num_tokens_to_compute)
             self._request_trackers[request.req_id] = request_tracker
 
+<<<<<<< HEAD
             # SKIP saving until explicitly asked to.
             if self.kv_role == "kv_producer":
                 continue
 
+=======
+            # NOTE(rob): scheduled new reqs need to be loaded on
+            # the consumer side only.
+            if self.kv_role == "kv_producer":
+                continue
+>>>>>>> async_pd
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -651,6 +667,45 @@ class LMCacheConnectorV1Impl:
                 discard_partial_chunks=self._discard_partial_chunks)
             if req_meta is not None:
                 meta.add_request(req_meta)
+
+<<<<<<< HEAD
+        # NOTE(rob): this is not needed since:
+        #   - a) we do not need to chunking (we send the KVs)
+        #           in one group after the request is done prefilling
+        #   - b) we do not need to load (on consumer side) once
+        #           we are in the decode phase
+        # NOTE(rob): this means we cannot get external blocks
+        # for resumed requests that were preempted.
+
+        # for request in scheduler_output.scheduled_cached_reqs:
+        #     request_tracker = self._request_trackers[request.req_id]
+        #     request_tracker.update(request)
+
+        #     req_meta = ReqMeta.from_request_tracker(
+        #         request_tracker,
+        #         self._block_size,
+        #         self._lmcache_chunk_size,
+        #         load_spec=None,
+        #         skip_save=force_skip_save,
+        #         discard_partial_chunks=self._discard_partial_chunks)
+        #     if req_meta is not None:
+        #         meta.add_request(req_meta)
+=======
+        # NOTE(rob): producer side sends the KVs.
+        for request_id in scheduler_output.new_KV_req_ids_to_send:
+            assert self.kv_role == "kv_producer"
+            request_tracker = self._request_trackers[request_id]
+
+            req_meta = ReqMeta.from_request_tracker(
+                request_tracker,
+                self._block_size,
+                self._lmcache_chunk_size,
+                load_spec=None,
+                skip_save=False,
+                discard_partial_chunks=self._discard_partial_chunks)
+            if req_meta is not None:
+                meta.add_request(req_meta)
+>>>>>>> async_pd
 
         # NOTE(rob): this is not needed since:
         #   - a) we do not need to chunking (we send the KVs)
