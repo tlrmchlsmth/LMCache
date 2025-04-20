@@ -602,6 +602,20 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
 
+        for request_id in scheduler_output.new_KV_req_ids_to_send:
+            assert self.kv_role == "kv_producer"
+            request_tracker = self._request_trackers[request_id]
+
+            req_meta = ReqMeta.from_request_tracker(
+                request_tracker,
+                self._block_size,
+                self._lmcache_chunk_size,
+                load_spec=None,
+                skip_save=False,
+                discard_partial_chunks=self._discard_partial_chunks)
+            if req_meta is not None:
+                meta.add_request(req_meta)
+
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
@@ -610,6 +624,10 @@ class LMCacheConnectorV1Impl:
             request_tracker = RequestTracker.from_new_request(
                 request, num_tokens_to_compute)
             self._request_trackers[request.req_id] = request_tracker
+
+            # SKIP saving until explicitly asked to.
+            if self.kv_role == "kv_producer":
+                continue
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
@@ -621,18 +639,26 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
-        for request in scheduler_output.scheduled_cached_reqs:
-            request_tracker = self._request_trackers[request.req_id]
-            request_tracker.update(request)
+        # NOTE(rob): this is not needed since:
+        #   - a) we do not need to chunking (we send the KVs)
+        #           in one group after the request is done prefilling
+        #   - b) we do not need to load (on consumer side) once
+        #           we are in the decode phase
+        # NOTE(rob): this means we cannot get external blocks
+        # for resumed requests that were preempted.
 
-            req_meta = ReqMeta.from_request_tracker(
-                request_tracker,
-                self._block_size,
-                self._lmcache_chunk_size,
-                load_spec=None,
-                skip_save=force_skip_save,
-                discard_partial_chunks=self._discard_partial_chunks)
-            if req_meta is not None:
-                meta.add_request(req_meta)
+        # for request in scheduler_output.scheduled_cached_reqs:
+        #     request_tracker = self._request_trackers[request.req_id]
+        #     request_tracker.update(request)
+
+        #     req_meta = ReqMeta.from_request_tracker(
+        #         request_tracker,
+        #         self._block_size,
+        #         self._lmcache_chunk_size,
+        #         load_spec=None,
+        #         skip_save=force_skip_save,
+        #         discard_partial_chunks=self._discard_partial_chunks)
+        #     if req_meta is not None:
+        #         meta.add_request(req_meta)
 
         return meta
