@@ -96,7 +96,7 @@ class LMCacheEngine:
             self.storage_manager = StorageManager(
                 config, metadata, self.memory_allocator,
                 self.lookup_server)  # type: ignore[assignment]
-        if self.enable_p2p:
+        if self.enable_p2p and False:
             self.distributed_loop = asyncio.get_event_loop()
             assert self.lookup_server is not None
             assert isinstance(self.storage_manager, StorageManager)
@@ -285,7 +285,7 @@ class LMCacheEngine:
             memory_obj = self.storage_manager.get(key)
 
             if memory_obj is None:
-                if self.enable_p2p:
+                if self.enable_p2p and False:
                     future_memory_obj = asyncio.run_coroutine_threadsafe(
                         self.distributed_server.issue_get(key),
                         self.distributed_loop)
@@ -368,7 +368,7 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
 
-        if self.enable_p2p:
+        if self.enable_p2p and False:
             self.distributed_server.close()
 
         if self.config.enable_controller:
