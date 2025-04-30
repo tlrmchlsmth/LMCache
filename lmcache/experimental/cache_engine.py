@@ -36,7 +36,7 @@ from lmcache.experimental.token_database import (ChunkedTokenDatabase,
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
-from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)
 
@@ -77,15 +77,21 @@ class LMCacheEngine:
         self.token_database = token_database
         self.gpu_connector = gpu_connector
 
-        self.enable_p2p = config.enable_p2p
+        self.enable_p2p = (config.enable_p2p and config.distributed_url
+                           and ":" in config.distributed_url)
 
         # NOTE: Unix systems use fork by default
         multiprocessing.set_start_method('spawn', force=True)
 
         self.lookup_server: Optional[LookupServerInterface] = None
-        # TODO(Jiayi): hard-coded for now
-        if self.enable_p2p:
+        if config.enable_p2p:
             self.lookup_server = RedisLookupServer(config)
+
+        # avoid circular import
+        from lmcache.experimental.cache_controller import LMCacheWorker
+        self.lmcache_worker: Optional[LMCacheWorker] = None
+        if self.config.enable_controller:
+            self.lmcache_worker = LMCacheWorker(config, metadata, self)
 
         self.use_distributed_storage_manager = False
         if config.enable_nixl:
@@ -94,8 +100,9 @@ class LMCacheEngine:
                 config, metadata, self.memory_allocator)
         else:
             self.storage_manager = StorageManager(
-                config, metadata, self.memory_allocator,
+                config, metadata, self.memory_allocator, self.lmcache_worker,
                 self.lookup_server)  # type: ignore[assignment]
+
         if self.enable_p2p:
             self.distributed_loop = asyncio.get_event_loop()
             assert self.lookup_server is not None
@@ -106,11 +113,6 @@ class LMCacheEngine:
                                        self.memory_allocator,
                                        self.distributed_loop,
                                        config)
-
-        if self.config.enable_controller:
-            # avoid circular import
-            from lmcache.experimental.cache_controller import LMCacheWorker
-            self.controller = LMCacheWorker(config, metadata, self)
 
         InitializeUsageContext(config.to_original_config(), metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -140,13 +142,13 @@ class LMCacheEngine:
         steds = []
         for start, end, key in self.token_database.process_tokens(
                 tokens, mask):
+            assert isinstance(key, CacheEngineKey)
             # Allocate the memory object
             num_tokens = end - start
             kv_shape = self.gpu_connector.get_shape(num_tokens)
             kv_dtype = self.metadata.kv_dtype
             memobj_meta = self.storage_manager.dry_allocate(kv_shape, kv_dtype)
             assert memobj_meta is not None
-
             keys.append(key)
             metadatas.append(memobj_meta)
             steds.append((start, end))
@@ -154,32 +156,43 @@ class LMCacheEngine:
         self.storage_manager.prepare_put(keys, metadatas)
 
         offload_time = 0.
+        put_time = 0.
         tot_kv_size = 0
         # Offload the KV cache and write to remote
         for key, memobj_meta, (start, end) in zip(keys, metadatas, steds):
             assert memobj_meta.dtype is not None
             kv_shape = memobj_meta.shape
             kv_dtype = memobj_meta.dtype
+
+            # Allocate for a zero-copy buffer, trigger send if needed
+            t = time.perf_counter()
             memory_obj = self.storage_manager.allocate(kv_shape, kv_dtype)
+            put_time += time.perf_counter() - t
             if memory_obj is None:
                 logger.warning("Failed to allocate memory for the KV cache.\n"
                                "The KV cache will not be stored.")
                 break
 
+            # Copy the KV cache to the zero-copy buffer
             t = time.perf_counter()
             self.gpu_connector.from_gpu(memory_obj, start, end, **kwargs)
             offload_time += time.perf_counter() - t
-            self.storage_manager.put(key, memory_obj)
+
             tot_kv_size += memory_obj.get_size()
 
         # Flush
+        t = time.perf_counter()
         self.storage_manager.commit_put()
-
+        put_time += time.perf_counter() - t
         ed = time.perf_counter()
+
+        assert mask is not None
+
         logger.info(
-            "Store time: %.4f ms, throughput: %.4f GB/s; offload_time: %.4f ms",
+            "Store %d tokens takes: %.4f ms, throughput: %.4f GB/s; "
+            "offload_time: %.4f ms, put_time: %.4f ms", torch.sum(mask),
             (ed - st) * 1000, tot_kv_size / (ed - st) / 1024**3,
-            offload_time * 1000)
+            offload_time * 1000, put_time * 1000)
 
         self.stats_monitor.on_store_finished(monitor_req_id)
 
@@ -219,6 +232,7 @@ class LMCacheEngine:
 
         for start, end, key in self.token_database.process_tokens(
                 tokens, mask):
+            assert isinstance(key, CacheEngineKey)
             if self.storage_manager.contains(key):
                 continue
             # Allocate the memory object
@@ -281,6 +295,8 @@ class LMCacheEngine:
         for start, end, key in self.token_database.process_tokens(
                 tokens, mask):
 
+            assert isinstance(key, CacheEngineKey)
+
             # Get the memory object from the storage backend
             memory_obj = self.storage_manager.get(key)
 
@@ -299,10 +315,13 @@ class LMCacheEngine:
             # cpu tensor for the sake of performance.
             # For example, disk->gpu is faster than disk->cpu->gpu.
             # RDMA is another example.
-
             self.gpu_connector.to_gpu(memory_obj, start, end, **kwargs)
             self.memory_allocator.ref_count_down(memory_obj)
-            if self.use_distributed_storage_manager:
+
+            # NOTE (ApostaC): This is only for the current implementation:
+            # When the object is retrieved back to vLLM, the storage backend
+            # will immediately remove the object from itself
+            if isinstance(self.storage_manager, DistributedStorageManager):
                 self.storage_manager.remove(key)
 
         retrieved_tokens = torch.sum(ret_mask)
@@ -323,6 +342,7 @@ class LMCacheEngine:
         """
         for start, end, key in self.token_database.process_tokens(
                 tokens, mask):
+            assert isinstance(key, CacheEngineKey)
             self.storage_manager.prefetch(key)
 
     # TODO(Jiayi): Currently, search_range is only used for testing.
@@ -342,9 +362,33 @@ class LMCacheEngine:
 
         :return: An int indicating how many prefix tokens are cached.
         """
+        end = 0
+        search_local = True  # we always lookup local storage_manager first
+        # secondary lookup on p2p (via lookup_server) if enabled
+        search_p2p = (self.enable_p2p
+                      and (search_range is None or "p2p" in search_range))
+
         for start, end, key in self.token_database.process_tokens(tokens):
-            if not self.storage_manager.contains(key, search_range):
-                return start
+            assert isinstance(key, CacheEngineKey)
+            if search_local:
+                if self.storage_manager.contains(key, search_range):
+                    # found in storage manager, no need to search p2p
+                    continue
+                else:
+                    # key not found in storage_manager
+                    # search only p2p from now on
+                    search_local = False
+            if search_p2p:
+                assert self.lookup_server is not None
+                if self.lookup_server.lookup(key):
+                    # found in p2p
+                    # continue loop to ensure a maximal prefix match
+                    continue
+            # not found in both storage_manager and p2p,
+            # return start, which equals last iteration's end
+            return start
+
+        # all tokens where found, return the maximal end
         return end
 
     def clear(
@@ -361,6 +405,7 @@ class LMCacheEngine:
         num_removed = 0
         # Only remove the caches for the given tokens
         for start, end, key in self.token_database.process_tokens(tokens):
+            assert isinstance(key, CacheEngineKey)
             removed = self.storage_manager.remove(key, locations)
             num_removed += removed
         return num_removed
@@ -371,8 +416,8 @@ class LMCacheEngine:
         if self.enable_p2p:
             self.distributed_server.close()
 
-        if self.config.enable_controller:
-            self.controller.close()
+        if self.lmcache_worker is not None:
+            self.lmcache_worker.close()
 
         self.storage_manager.close()
         logger.info("LMCacheEngine closed.")
